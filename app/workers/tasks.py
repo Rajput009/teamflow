@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from app.core.config import get_settings
 from app.models import Notification, NotificationType
 from app.workers.celery_app import celery_app
+from app.workers.chat_summary import summarize_chat_session as _summarize_chat_session
 
 logger = logging.getLogger("teamflow.workers")
 
@@ -93,6 +94,24 @@ async def _create_notification(
             await session.rollback()
             raise
     logger.info("notification created: recipient=%s type=%s", recipient, ntype)
+
+
+@celery_app.task(name="memory.summarize", ignore_result=True)
+def summarize_chat_session(
+    organization_id: str, session_id: str, expected_watermark: str | None = None
+) -> None:
+    """Fold the session's out-of-window messages into an anchored summary.
+
+    Runs off the hot path. Its own production session; CAS watermark; never
+    inserts into a memory table (see docs/features/13 §3.3 HARD RULE).
+    """
+    run_async(
+        _summarize_chat_session(
+            organization_id=organization_id,
+            session_id=session_id,
+            expected_watermark=expected_watermark,
+        )
+    )
 
 
 @celery_app.task(name="emails.send", ignore_result=True)

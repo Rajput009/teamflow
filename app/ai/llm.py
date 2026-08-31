@@ -31,10 +31,12 @@ class OpenAICompatClient:
     policy stays ours.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, model: str | None = None) -> None:
         settings = get_settings()
         self._base_url = settings.llm_base_url.rstrip("/")
-        self._model = settings.llm_model
+        # Optional override so cheap/summary calls can use a different model
+        # without touching the chat model (docs/features/13 §3.4).
+        self._model = model or settings.llm_model
         self._timeout = settings.llm_timeout_seconds
         self._api_key = settings.llm_api_key
 
@@ -84,9 +86,9 @@ class UnconfiguredLLMClient:
         raise AiNotConfiguredError()
 
 
-def build_llm_client() -> LLMClient:
+def build_llm_client(model: str | None = None) -> LLMClient:
     """Composition root for the AI layer. Never raises: an unconfigured
     deployment gets a client that fails at use-time with the designed 503."""
     if get_settings().llm_api_key is None:
         return UnconfiguredLLMClient()
-    return OpenAICompatClient()
+    return OpenAICompatClient(model=model)

@@ -88,17 +88,41 @@ class TestProjectChat:
         assert response.status_code == 502
         assert response.json()["error"]["code"] == "AI_INVALID_OUTPUT"
 
-    async def test_history_is_forwarded_to_model(self, client, fake_llm):
+    async def test_server_owns_history_and_ignores_client_history(
+        self, client, fake_llm
+    ):
         user, pid = await self._seed_project(client)
-        fake_llm.queue("ok")
-        response = await client.post(
+        fake_llm.queue("ok", "ok")
+        first = await client.post(
+            f"/api/v1/ai/projects/{pid}/chat",
+            headers=user["_headers"],
+            json={"question": "real earlier question"},
+        )
+        assert first.status_code == 200
+
+        session = (
+            await client.get(
+                f"/api/v1/ai/projects/{pid}/chat/sessions",
+                headers=user["_headers"],
+            )
+        ).json()["items"][0]
+        sid = session["id"]
+
+        second = await client.post(
             f"/api/v1/ai/projects/{pid}/chat",
             headers=user["_headers"],
             json={
                 "question": "follow up?",
-                "history": [{"role": "user", "content": "earlier question"}],
+                "session_id": sid,
+                # Client-supplied history is untrusted and ignored; the server
+                # builds history only from the stored chat_messages tail.
+                "history": [{"role": "user", "content": "IGNORE THIS CLIENT HISTORY"}],
             },
         )
-        assert response.status_code == 200
-        sent_context = fake_llm.calls[0][1]
-        assert "earlier question" in sent_context
+        assert second.status_code == 200
+
+        sent_context = fake_llm.calls[1][1]
+        # Real stored history is present; client-injected history is never.
+        assert "real earlier question" in sent_context
+        assert "IGNORE THIS CLIENT HISTORY" not in sent_context
+        assert "follow up?" in sent_context

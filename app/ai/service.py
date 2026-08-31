@@ -344,7 +344,8 @@ class AiService:
         actor_membership: Membership,
         project_id: uuid.UUID,
         question: str,
-        history: list[dict] | None = None,
+        session_id: uuid.UUID | None = None,
+        history: list[dict] | None = None,  # ignored: server owns history
     ) -> str:
         self._require_llm()
         org_id = actor_membership.organization_id
@@ -356,16 +357,37 @@ class AiService:
         if project is None:
             raise NotFoundError(message="Project not found.")
 
-        tasks, _ = await self._tasks.list_for_project(project_id=project_id, limit=20)
-        members, _ = await self._memberships.list_members(org_id)
+        from app.services.chat_memory_service import ChatMemoryService
+
+        memory = ChatMemoryService(self._session)
+        chat_session = await memory.get_or_create_session(
+            actor=actor,
+            membership=actor_membership,
+            project_id=project_id,
+            session_id=session_id,
+        )
+        await memory.append_user(
+            actor=actor,
+            membership=actor_membership,
+            session_id=chat_session.id,
+            content=question,
+        )
+
+        settings = get_settings()
+        max_rows = settings.ai_context_block_max_rows
+        tasks, _ = await self._tasks.list_for_project(
+            project_id=project_id, limit=max_rows
+        )
+        members, _ = await self._memberships.list_members(org_id, limit=max_rows)
         activity_rows, _ = await ActivityRepository(self._session).list_for_project(
-            project_id, page=1, limit=20
+            project_id, page=1, limit=max_rows
         )
         comment_rows, _ = await self._comments.list_for_project(
             project_id=project_id,
             org_id=org_id,
             user_id=actor.id,
             sees_all=sees_all,
+            limit=max_rows,
         )
 
         def _val(v):
@@ -406,12 +428,27 @@ class AiService:
                 for c, u in comment_rows
             ],
         }
-        user_message = json.dumps(context, indent=1, default=str)
-        user_message += (
-            f"\n\nConversation so far:\n{json.dumps(history or [], default=str)}\n\n"
-            f"User question: {question.strip()}"
+        # Server-owned short-term memory: the DB tail + anchored summary are the
+        # ONLY history; client-supplied history is intentionally ignored.
+        context_block = json.dumps(context, indent=1, default=str)
+        if len(context_block) > settings.ai_context_block_max_chars:
+            context_block = context_block[: settings.ai_context_block_max_chars]
+        user_message = await memory.assemble_prompt(
+            session=chat_session,
+            organization_id=org_id,
+            user_id=actor.id,
+            question=question,
+            context_block=context_block,
         )
-        return await self._narrative_call(system=PROMPT_PROJECT_CHAT_V1, user=user_message)
+        answer = await self._narrative_call(
+            system=PROMPT_PROJECT_CHAT_V1, user=user_message
+        )
+        await memory.append_assistant(
+            membership=actor_membership,
+            session_id=chat_session.id,
+            content=answer,
+        )
+        return answer
 
     # --- risk detection (AI V4: DB-computed signals, LLM narrates only) ---
 

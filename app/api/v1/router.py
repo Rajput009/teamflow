@@ -4,6 +4,7 @@ from app.api.v1.endpoints import (
     activities,
     ai,
     auth,
+    chat_sessions,
     comments,
     health,
     notifications,
@@ -22,3 +23,4 @@ api_router.include_router(comments.router)
 api_router.include_router(activities.router)
 api_router.include_router(notifications.router)
 api_router.include_router(ai.router)
+api_router.include_router(chat_sessions.router)
