@@ -113,7 +113,7 @@ def upgrade() -> None:
             nullable=False,
         ),
         sa.CheckConstraint(
-            "char_length(content) > 0", name=op.f("ck_chat_messages_content")
+            "btrim(content) <> ''", name=op.f("ck_chat_messages_content")
         ),
         sa.CheckConstraint(
             "role IN ('user', 'assistant')", name=op.f("ck_chat_messages_role")

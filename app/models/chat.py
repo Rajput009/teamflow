@@ -83,7 +83,7 @@ class ChatMessage(Base):
         UniqueConstraint("session_id", "seq", name="uq_chat_messages_session_id_seq"),
         Index("ix_chat_messages_session_seq", "session_id", "seq"),
         CheckConstraint("role IN ('user', 'assistant')", name="ck_chat_messages_role"),
-        CheckConstraint("char_length(content) > 0", name="ck_chat_messages_content"),
+        CheckConstraint("btrim(content) <> ''", name="ck_chat_messages_content"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(

@@ -125,7 +125,8 @@ CREATE TABLE chat_messages (
     session_id                UUID NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
     seq                       INTEGER NOT NULL,       -- per-session order, incremented under row lock
     role                      VARCHAR(20) NOT NULL,   -- 'user' | 'assistant' (CHECK)
-    content                   TEXT NOT NULL CHECK (char_length(content) > 0),
+    -- non-empty AFTER trimming: whitespace-only rows must also die at the DB
+    content                   TEXT NOT NULL CHECK (btrim(content) <> ''),
     meta                      JSONB NOT NULL DEFAULT '{}',  -- model, usage, latency_ms, finish_reason
     created_at                TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     UNIQUE (session_id, seq)
@@ -188,7 +189,7 @@ A session belongs to exactly one user + project + org. Other orgs/users get 404.
 |---|---|
 | `POST /chat` with someone else's / other-org `session_id` | **404** (not 403) |
 | `POST /chat` after `DELETE` | **404**; do NOT lazy-recreate that UUID |
-| `POST /chat` on `is_active=false` | **409** (or 404). Do not silently revive. PATCH is the revive path. |
+| `POST /chat` on `is_active=false` | **409**. Do not silently revive. PATCH is the revive path. |
 | User lost project visibility | **404** on every session route, even sessions they own |
 | LLM 5xx after user row written | Persist the user row, return 502, no assistant row. Retry may duplicate the user message — document it; do NOT invent idempotency keys in Phase 1 |
 | `GET .../sessions` list | **No `summary`**. Title, timestamps, `is_active`. Summary is detail-only |
@@ -220,9 +221,10 @@ class ChatMemoryService:
 ```text
 tail     = last AI_CHAT_HISTORY_MESSAGES messages          # always raw
 to_fold  = messages AFTER summarized_upto_message_id AND BEFORE the tail
+to_fold  = to_fold minus a trailing user message          # never fold half a turn
 trigger  = len(to_fold) >= AI_CHAT_SUMMARY_EVERY           # >=10 messages have LEFT the window
 extend   = old summary + to_fold                           # never the tail, never from scratch
-watermark = last folded message id
+watermark = last folded message id                        # always an assistant message
 ```
 
 Define a **turn** = one user+assistant pair. Count **messages that have left the
@@ -230,6 +232,12 @@ window**, not "chat requests." Worker input is `existing summary + to_fold`; it
 must NOT receive `recent_messages(limit=50)` (that would be a full rewrite). If
 the worker is behind, the next chat still works — stale summary + last 20, no
 catch-up full re-summary.
+
+**Fold boundary rule:** a pair may straddle the watermark, so `to_fold` must end
+on an `assistant` row. If the last column is `user`, drop it and leave it for the
+next job — that user's answer is still raw in the tail, so folding the question
+alone would give the model a summary fragment with no reply. `watermark` is
+therefore always the id of a folded `assistant` message.
 
 **Async summary (Phase 1):** summarization runs on the **worker**, never inline.
 The chat request only appends the new turn and returns; a `memory.summarize`
@@ -254,6 +262,12 @@ tail is always present.
   **session summary + last 20 messages**. This is the *anchored incremental
   summarization* pattern: extend the existing summary, never regenerate it.
 - **Lossless at rest means REJECT, never silently edit.** Two decisions:
+  - **Units are UTF-8 BYTES.** Every `_max_bytes` knob is a byte cap, not a
+    character cap: Python uses `len(content.encode('utf-8'))`, Postgres uses
+    `octet_length(...)`. Never compute a byte cap with `len(str)` or
+    `char_length(...)` — a "4000 byte" limit enforced in characters can be
+    ~16KB on the wire. (The non-empty CHECK is the one exception: whitespace
+    detection is a character concern, so it uses `btrim(content) <> ''`.)
   - **DB write:** oversize `content > ai_chat_message_max_bytes` → **422**. Do not
     truncate-on-write. That is how you get "that's not what I sent."
   - **Prompt assemble:** trim/drop **old** tail rows until under
@@ -261,7 +275,10 @@ tail is always present.
     (summary is itself capped at write — see next).
 - **Cap the summary.** `summary TEXT` will blow the prompt otherwise:
   `ai_chat_summary_max_bytes=4000`; worker truncates at the four headings (keeps
-  `Decisions:` etc., drops overflow). If the summary call fails, leave the old
+  `Decisions:` etc., drops overflow). **Fallback:** if the cheap model returns
+  prose with no headings, the worker still hard-truncates the text at
+  `ai_chat_summary_max_bytes` bytes before writing — the cap must never be
+  bypassed by the model's formatting. If the summary call fails, leave the old
   summary + old watermark and return (chat still 200s).
 - **One allocator** — `assemble_prompt()` owns every budget (history count,
   per-message bytes, prompt bytes, context-block chars). Explicit drop order:
@@ -354,6 +371,9 @@ ai_context_block_max_chars: int = 2000
     turns that it lands in tail+summary, then for EVERY `fake_llm` call assert:
     the string appears only in the **user** message; `system` bytes are
     **identical** to a control chat without it; it never appears in tool JSON.
+    The system prompt is static by design, so byte-equality is testable today;
+    if a dynamic system component (date, org name) is ever added, this check
+    must use a fixed clock / normalized fixture instead of comparing live bytes.
 12. Client `history` is ignored: sending `history=[...]` does not change the prompt.
 13. Auto-title: `title` set on FIRST user append (`question[:60]`), NULL on an empty
     session; explicit PATCH overrides.
@@ -362,7 +382,7 @@ ai_context_block_max_chars: int = 2000
 15. **List payload has NO `summary`** — title/timestamps/`is_active` only; summary
     is detail-only.
 16. **Deleted / inactive / foreign `session_id` on `POST /chat`:** deleted → 404
-    (no lazy-recreate of that UUID); `is_active=false` → 409 (or 404); other-org
+    (no lazy-recreate of that UUID); `is_active=false` → 409; other-org
     or other-user → 404. Never silently revive.
 17. Tail is **chronological** (oldest of the last 20 first) and ordering is by
     `seq`, not `created_at`.
@@ -399,7 +419,7 @@ CREATE TABLE ai_memory_items (
     kind               ai_memory_kind  NOT NULL DEFAULT 'fact',
     -- exactly one of project_id/user_id must be set per scope:
     --   org => both NULL, project => project_id set, user => user_id set
-    content            TEXT NOT NULL CHECK (char_length(content) <= 1000),
+    content            TEXT NOT NULL CHECK (octet_length(content) <= 1000),
     -- TEXT[] NOT JSONB: array_to_string(JSONB) is invalid SQL. Use a real array.
     tags               TEXT[] NOT NULL DEFAULT '{}',
     source             ai_memory_source NOT NULL DEFAULT 'explicit',

@@ -112,6 +112,13 @@ async def summarize_chat_session(
             ).all()
         )
 
+        # Fold boundary: never split a user+assistant turn. If the pair straddles
+        # the watermark/tail edge, drop the trailing user row — its assistant
+        # reply is still raw in the tail, so the watermark always lands on an
+        # assistant message.
+        if to_fold and to_fold[-1].role == "user":
+            to_fold = to_fold[:-1]
+
         if len(to_fold) < settings.ai_chat_summary_every:
             return
 

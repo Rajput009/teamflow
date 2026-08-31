@@ -71,6 +71,94 @@ class TestWorkerBody:
         await asyncio.sleep(0)
 
 
+    async def test_trailing_user_is_dropped_before_fold(self, monkeypatch):
+        """§1 fold-boundary: a user message straddling the watermark/tail edge
+        must NOT be folded; the watermark advances only to an assistant row."""
+        next_seq = 0
+        capture = {}
+
+        def make_msg(seq, role):
+            return SimpleNamespace(
+                id=uuid.UUID(int=seq),
+                seq=seq,
+                role=role,
+                content=f"content-{seq}",
+            )
+
+        # 11 messages, last one a bare user message (incomplete turn).
+        messages = [
+            make_msg(i, "assistant" if i % 2 == 0 else "user")
+            for i in range(1, 12)
+        ]
+        messages[-1] = make_msg(11, "user")
+
+        class FakeLLM:
+            async def complete(self, *, system, user):
+                capture["user"] = user
+                return (
+                    "Decisions: x\n"
+                    "Open questions: y\n"
+                    "Constraints / preferences mentioned: z\n"
+                    "Facts the user asserted: w"
+                )
+
+        class FakeRepo:
+            def __init__(self, session):
+                self._session = session
+
+            async def recent_messages(self, *args, **kwargs):
+                return []
+
+            async def advance_summary(self, **kwargs):
+                capture["last_folded"] = kwargs["last_folded_message_id"]
+                return True
+
+        class FakeSession:
+            async def scalar(self, _query):
+                nonlocal next_seq
+                next_seq += 1
+                if next_seq == 1:
+                    return SimpleNamespace(summary=None, user_id=uuid.UUID(int=1))
+                return None
+
+            async def scalars(self, _query):
+                return SimpleNamespace(all=lambda: messages.copy())
+
+            async def commit(self):
+                capture["committed"] = True
+
+        class _Ctx:
+            def __init__(self, session):
+                self._session = session
+
+            async def __aenter__(self):
+                return self._session
+
+            async def __aexit__(self, *exc):
+                return False
+
+        class FakeFactory:
+            def __call__(self):
+                return _Ctx(FakeSession())
+
+        monkeypatch.setattr("app.workers.chat_summary.ChatRepository", FakeRepo)
+        monkeypatch.setattr("app.workers.chat_summary.async_session_factory", FakeFactory)
+        monkeypatch.setattr(
+            "app.workers.chat_summary.build_llm_client",
+            lambda model=None: FakeLLM(),
+        )
+
+        await summarize_chat_session(
+            organization_id=str(uuid.uuid4()),
+            session_id=str(uuid.uuid4()),
+            expected_watermark=None,
+        )
+        assert capture["last_folded"] == uuid.UUID(int=10)
+        assert capture["committed"] is True
+        assert "content-11" not in capture["user"]  # trailing user not folded
+        assert "content-10" in capture["user"]  # its assistant reply is folded
+
+
 class TestTruncateSummary:
     def test_short_summary_is_unchanged(self):
         text = "Decisions:\n- ship phase one\n"
