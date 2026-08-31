@@ -1,16 +1,29 @@
-"""Worker-side summary helper tests (docs/features/13-ai-memory.md §3.5).
+"""Worker-side summary tests (docs/features/13-ai-memory.md §3.1/§3.3/§3.5).
 
-The full worker path needs committed Postgres rows and is covered by
-test_ai_chat_memory.py's summary cases. These unit tests pin the two decisions
-that are easy to regress and don't need a DB:
-
-- the summary is capped at the four schema headings (never mid-heading), and
-- the body is a no-op when it is called with no committed messages to fold.
+Three layers:
+- unit tests for the byte-cap helper (no DB),
+- unit tests for the fold-boundary worker body (fake session, no DB),
+- integration tests with committed Postgres rows so the worker's production
+  session factory can see what it must fold.
 """
 import asyncio
 import uuid
 from types import SimpleNamespace
+from typing import Any
 
+import pytest_asyncio
+from sqlalchemy.ext.asyncio import async_sessionmaker
+
+from app.core.exceptions import AiUpstreamError
+from app.models import (
+    ChatMessage,
+    ChatSession,
+    Membership,
+    Organization,
+    OrgRole,
+    Project,
+    User,
+)
 from app.workers.chat_summary import _truncate_summary, summarize_chat_session
 
 
@@ -44,10 +57,6 @@ class TestWorkerBody:
             async def commit(self):
                 raise AssertionError("must not commit below threshold")
 
-        class FakeFactory:
-            def __call__(self):
-                return _Ctx(FakeSession())
-
         class _Ctx:
             def __init__(self, session):
                 self._session = session
@@ -57,6 +66,10 @@ class TestWorkerBody:
 
             async def __aexit__(self, *exc):
                 return False
+
+        class FakeFactory:
+            def __call__(self):
+                return _Ctx(FakeSession())
 
         def fake_build(model=None):
             raise AssertionError("LLM must not be called below threshold")
@@ -72,12 +85,11 @@ class TestWorkerBody:
         )
         await asyncio.sleep(0)
 
-
     async def test_trailing_user_is_dropped_before_fold(self, monkeypatch):
-        """§1 fold-boundary: a user message straddling the watermark/tail edge
+        """§3.3 fold-boundary: a user message straddling the watermark/tail edge
         must NOT be folded; the watermark advances only to an assistant row."""
         next_seq = 0
-        capture = {}
+        capture: dict[str, Any] = {}
 
         def make_msg(seq, role):
             return SimpleNamespace(
@@ -184,3 +196,167 @@ class TestTruncateSummary:
         capped = _truncate_summary(text, 20)
         capped.encode("utf-8")  # must not raise UnicodeEncodeError
         assert len(capped.encode("utf-8")) <= 20
+
+
+class TestWorkerIntegration:
+    """Real Postgres rows, committed, read back by the worker helper."""
+
+    async def _seed(
+        self,
+        db_engine,
+        message_count: int = 31,
+        summary: str | None = None,
+        watermark_id: uuid.UUID | None = None,
+    ) -> dict[str, uuid.UUID]:
+        factory = async_sessionmaker(db_engine, expire_on_commit=False)
+        org_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        project_id = uuid.uuid4()
+        session_id = uuid.uuid4()
+        suffix = uuid.uuid4().hex[:8]
+
+        async with factory() as session:
+            user = User(
+                id=user_id,
+                email=f"worker-{suffix}@test.com",
+                hashed_password="x",
+                full_name="Worker",
+            )
+            session.add(user)
+            await session.flush()
+
+            session.add(
+                Organization(
+                    id=org_id,
+                    name="Worker Org",
+                    slug=f"worker-{suffix}",
+                    created_by_id=user_id,
+                )
+            )
+            session.add(
+                Membership(
+                    id=uuid.uuid4(),
+                    organization_id=org_id,
+                    user_id=user_id,
+                    role=OrgRole.OWNER,
+                )
+            )
+            session.add(
+                Project(
+                    id=project_id,
+                    organization_id=org_id,
+                    name="Worker Project",
+                    created_by_id=user_id,
+                )
+            )
+            session.add(
+                ChatSession(
+                    id=session_id,
+                    organization_id=org_id,
+                    project_id=project_id,
+                    user_id=user_id,
+                    title=None,
+                    summary=summary,
+                    summarized_upto_message_id=watermark_id,
+                    meta={},
+                    is_active=True,
+                )
+            )
+            for i in range(1, message_count + 1):
+                session.add(
+                    ChatMessage(
+                        id=uuid.UUID(int=i),
+                        session_id=session_id,
+                        seq=i,
+                        role="user" if i % 2 else "assistant",
+                        content=f"content-{i}",
+                        meta={},
+                    )
+                )
+            await session.commit()
+
+        return {
+            "organization_id": org_id,
+            "user_id": user_id,
+            "project_id": project_id,
+            "session_id": session_id,
+        }
+
+    async def _read_session(self, db_engine, session_id: uuid.UUID) -> ChatSession:
+        factory = async_sessionmaker(db_engine, expire_on_commit=False)
+        async with factory() as session:
+            return await session.get(ChatSession, session_id)
+
+    @pytest_asyncio.fixture(autouse=True)
+    def _fake_llm_factory(self, monkeypatch):
+        class OkLLM:
+            async def complete(self, *, system, user):
+                return (
+                    "Decisions: folded\n"
+                    "Open questions: still open\n"
+                    "Constraints / preferences mentioned: none\n"
+                    "Facts the user asserted: test data"
+                )
+
+        factory = OkLLM()
+        monkeypatch.setattr(
+            "app.workers.chat_summary.build_llm_client",
+            lambda model=None: factory,
+        )
+        return factory
+
+    async def test_worker_folds_and_advances_watermark(self, db_engine):
+        ids = await self._seed(db_engine, message_count=31)
+        await summarize_chat_session(
+            organization_id=str(ids["organization_id"]),
+            session_id=str(ids["session_id"]),
+            expected_watermark=None,
+        )
+
+        session = await self._read_session(db_engine, ids["session_id"])
+        assert session.summary is not None
+        assert "Decisions:" in session.summary
+        # to_fold = seq 1..11 minus trailing user seq11 => up to seq10 (assistant)
+        assert session.summarized_upto_message_id == uuid.UUID(int=10)
+
+    async def test_provider_failure_leaves_old_summary_and_watermark(
+        self, db_engine, monkeypatch
+    ):
+        ids = await self._seed(db_engine, message_count=31)
+
+        class BrokenLLM:
+            async def complete(self, *, system, user):
+                raise AiUpstreamError()
+
+        monkeypatch.setattr(
+            "app.workers.chat_summary.build_llm_client",
+            lambda model=None: BrokenLLM(),
+        )
+        await summarize_chat_session(
+            organization_id=str(ids["organization_id"]),
+            session_id=str(ids["session_id"]),
+            expected_watermark=None,
+        )
+
+        session = await self._read_session(db_engine, ids["session_id"])
+        assert session.summary is None
+        assert session.summarized_upto_message_id is None
+
+    async def test_stale_watermark_job_noops(self, db_engine):
+        ids = await self._seed(
+            db_engine,
+            message_count=31,
+            summary="Decisions: old",
+            watermark_id=uuid.UUID(int=10),
+        )
+        # A stale job carries expected_watermark=None, but the row has already
+        # advanced to seq10; the CAS must reject the double-fold.
+        await summarize_chat_session(
+            organization_id=str(ids["organization_id"]),
+            session_id=str(ids["session_id"]),
+            expected_watermark=None,
+        )
+
+        session = await self._read_session(db_engine, ids["session_id"])
+        assert session.summary == "Decisions: old"
+        assert session.summarized_upto_message_id == uuid.UUID(int=10)

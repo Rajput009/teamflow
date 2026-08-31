@@ -389,7 +389,8 @@ ai_context_block_max_chars: int = 2000
     `seq`, not `created_at`.
 18. `last_message_at` moves on append and drives list order.
 19. Delete session cascades messages.
-20. Rename/inactive PATCH works for owner, 403 for others, 404 cross-org.
+20. Rename/inactive PATCH works for owner, 404 for other users / cross-org (the
+    session is owner-private; a non-owner is indistinguishable from missing).
 21. Concurrent `append` (two tabs + summarize job) does not reorder or double-fold:
     row lock + `seq` (+ `SKIP LOCKED`) produce one canonical order.
 

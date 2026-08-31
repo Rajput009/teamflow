@@ -3,13 +3,22 @@
 Phase-1 acceptance: server-owned history, owner-scoped sessions, append under a
 row lock + per-session seq, capped prompt, async anchored summary, and the
 mandatory prompt-injection isolation test.
+
+These are integration tests that need the teamflow_test Postgres from the
+existing conftest. Summary-worker cases that require committed rows live in
+test_chat_summary_worker.py.
 """
+import os
 import uuid
+from datetime import UTC, datetime
 
 import httpx
 
+from app.core.config import get_settings
+from app.models import ChatMessage
 from app.tests.factories import (
     add_member,
+    add_project_member,
     create_organization,
     create_project,
     create_user,
@@ -35,6 +44,14 @@ def _session_path(pid: uuid.UUID, sid: uuid.UUID) -> str:
 
 def _messages_path(pid: uuid.UUID, sid: uuid.UUID) -> str:
     return f"{_session_path(pid, sid)}/messages"
+
+
+async def _create_session(client, user, pid):
+    response = await client.post(
+        _sessions_path(pid), headers=user["_headers"]
+    )
+    assert response.status_code == 201, response.text
+    return response.json()
 
 
 async def _chat(client, user, pid, question, session_id=None, history=None):
@@ -76,19 +93,36 @@ class TestSessionCrud:
         response = await client.post(_sessions_path(pid), headers=outsider["_headers"])
         assert response.status_code == 404
 
+    async def test_empty_session_title_is_null(self, client, fake_llm):
+        user, _, pid = await _seed_owner(client)
+        session = await _create_session(client, user, pid)
+        assert session["title"] is None
+
     async def test_detail_no_summary_in_list(self, client, fake_llm):
         user, _, pid = await _seed_owner(client)
-        session = await client.post(_sessions_path(pid), headers=user["_headers"])
-        sid = session.json()["id"]
+        session = await _create_session(client, user, pid)
+        sid = session["id"]
         listed = await client.get(_sessions_path(pid), headers=user["_headers"])
         assert "summary" not in listed.json()["items"][0]
         detail = await client.get(_session_path(pid, sid), headers=user["_headers"])
         assert "summary" in detail.json()
 
+    async def test_patch_rename_overrides_auto_title(self, client, fake_llm):
+        user, _, pid = await _seed_owner(client)
+        session = await _create_session(client, user, pid)
+        sid = session["id"]
+        patch = await client.patch(
+            _session_path(pid, sid),
+            headers=user["_headers"],
+            json={"title": "Renamed thread"},
+        )
+        assert patch.status_code == 200
+        assert patch.json()["title"] == "Renamed thread"
+
     async def test_inactive_session_conflicts_on_append(self, client, fake_llm):
         user, _, pid = await _seed_owner(client)
-        session = await client.post(_sessions_path(pid), headers=user["_headers"])
-        sid = session.json()["id"]
+        session = await _create_session(client, user, pid)
+        sid = session["id"]
         patch = await client.patch(
             _session_path(pid, sid),
             headers=user["_headers"],
@@ -104,8 +138,8 @@ class TestSessionCrud:
 
     async def test_delete_cascades(self, client, fake_llm):
         user, _, pid = await _seed_owner(client)
-        session = await client.post(_sessions_path(pid), headers=user["_headers"])
-        sid = session.json()["id"]
+        session = await _create_session(client, user, pid)
+        sid = session["id"]
         await client.post(
             _messages_path(pid, sid),
             headers=user["_headers"],
@@ -116,28 +150,115 @@ class TestSessionCrud:
         detail = await client.get(_session_path(pid, sid), headers=user["_headers"])
         assert detail.status_code == 404
 
-    async def test_patch_rename_overrides_auto_title(self, client, fake_llm):
-        user, _, pid = await _seed_owner(client)
-        session = await client.post(_sessions_path(pid), headers=user["_headers"])
-        sid = session.json()["id"]
-        patch = await client.patch(
-            _session_path(pid, sid),
-            headers=user["_headers"],
-            json={"title": "Renamed thread"},
-        )
-        assert patch.status_code == 200
-        assert patch.json()["title"] == "Renamed thread"
-
     async def test_cross_project_session_use_is_404(self, client, fake_llm):
         user, _, pid = await _seed_owner(client)
         other_project = await create_project(client, user, "Beta")
         other_pid = uuid.UUID(other_project["id"])
-        session = await client.post(_sessions_path(pid), headers=user["_headers"])
-        sid = uuid.UUID(session.json()["id"])
+        session = await _create_session(client, user, pid)
+        sid = uuid.UUID(session["id"])
 
         fake_llm.queue("ok")
         response = await _chat(client, user, other_pid, "hi", session_id=sid)
         assert response.status_code == 404
+
+    async def test_last_message_at_drives_list_order(self, client, fake_llm):
+        user, _, pid = await _seed_owner(client)
+        first = await _create_session(client, user, pid)
+        second = await _create_session(client, user, pid)
+        first_sid = uuid.UUID(first["id"])
+        second_sid = uuid.UUID(second["id"])
+
+        await client.post(
+            _messages_path(pid, first_sid),
+            headers=user["_headers"],
+            json={"content": "older"},
+        )
+        await client.post(
+            _messages_path(pid, second_sid),
+            headers=user["_headers"],
+            json={"content": "newer"},
+        )
+
+        listed = await client.get(_sessions_path(pid), headers=user["_headers"])
+        items = listed.json()["items"]
+        assert [item["id"] for item in items] == [str(second_sid), str(first_sid)]
+        assert all(item["last_message_at"] is not None for item in items)
+
+
+class TestChatTenancy:
+    async def test_cross_org_messages_are_404(self, client, fake_llm):
+        outsider = await create_user(client)
+        await create_organization(client, outsider, "Elsewhere")
+        user, _, pid = await _seed_owner(client)
+        session = await _create_session(client, user, pid)
+        sid = uuid.UUID(session["id"])
+
+        resp = await client.get(
+            _messages_path(pid, sid), headers=outsider["_headers"]
+        )
+        assert resp.status_code == 404
+
+    async def test_deleted_session_on_chat_is_404(self, client, fake_llm):
+        user, _, pid = await _seed_owner(client)
+        session = await _create_session(client, user, pid)
+        sid = uuid.UUID(session["id"])
+        await client.delete(_session_path(pid, sid), headers=user["_headers"])
+
+        fake_llm.queue("ok")
+        resp = await _chat(client, user, pid, "hi", session_id=sid)
+        assert resp.status_code == 404
+
+    async def test_inactive_session_on_chat_is_409(self, client, fake_llm):
+        user, _, pid = await _seed_owner(client)
+        session = await _create_session(client, user, pid)
+        sid = uuid.UUID(session["id"])
+        await client.patch(
+            _session_path(pid, sid),
+            headers=user["_headers"],
+            json={"is_active": False},
+        )
+
+        fake_llm.queue("ok")
+        resp = await _chat(client, user, pid, "hi", session_id=sid)
+        assert resp.status_code == 409
+
+    async def test_foreign_session_on_chat_is_404(self, client, fake_llm):
+        user, _, pid = await _seed_owner(client)
+        session = await _create_session(client, user, pid)
+        sid = uuid.UUID(session["id"])
+
+        other = await create_user(client)
+        member = await add_member(client, user, other["email"], role="OWNER")
+        await add_project_member(
+            client,
+            user,
+            pid,
+            uuid.UUID(member["user_id"]),
+        )
+
+        fake_llm.queue("ok")
+        resp = await _chat(client, other, pid, "hi", session_id=sid)
+        assert resp.status_code == 404
+
+    async def test_patch_other_user_is_404(self, client, fake_llm):
+        user, _, pid = await _seed_owner(client)
+        session = await _create_session(client, user, pid)
+        sid = uuid.UUID(session["id"])
+
+        other = await create_user(client)
+        member = await add_member(client, user, other["email"], role="OWNER")
+        await add_project_member(
+            client,
+            user,
+            pid,
+            uuid.UUID(member["user_id"]),
+        )
+        resp = await client.patch(
+            _session_path(pid, sid),
+            headers=other["_headers"],
+            json={"is_active": False},
+        )
+        assert resp.status_code == 404
 
 
 class TestServerOwnedHistory:
@@ -185,8 +306,8 @@ class TestServerOwnedHistory:
 
     async def test_oversize_write_is_422(self, client, fake_llm):
         user, _, pid = await _seed_owner(client)
-        session = await client.post(_sessions_path(pid), headers=user["_headers"])
-        sid = session.json()["id"]
+        session = await _create_session(client, user, pid)
+        sid = session["id"]
         big = "x" * 16001
         response = await client.post(
             _messages_path(pid, sid),
@@ -198,8 +319,8 @@ class TestServerOwnedHistory:
     async def test_history_cap_only_last_twenty_sent(self, client, fake_llm):
         user, _, pid = await _seed_owner(client)
         fake_llm.queue(*("ok" for _ in range(21)))
-        session = await client.post(_sessions_path(pid), headers=user["_headers"])
-        sid = session.json()["id"]
+        session = await _create_session(client, user, pid)
+        sid = session["id"]
         for i in range(21):
             response = await _chat(client, user, pid, f"message {i}", session_id=sid)
             assert response.status_code == 200
@@ -208,6 +329,62 @@ class TestServerOwnedHistory:
         assert "message 20" in sent  # current question always survives
         assert "message 15" in sent  # tail window includes the last N
         assert "message 10" not in sent  # oldest dropped from the prompt
+
+    async def test_messages_ordered_by_seq_not_created_at(
+        self, client, fake_llm, db_session
+    ):
+        user, _, pid = await _seed_owner(client)
+        session = await _create_session(client, user, pid)
+        sid = uuid.UUID(session["id"])
+
+        same = datetime.now(UTC)
+        for seq, role, content in (
+            (2, "user", "second"),
+            (1, "assistant", "first"),
+        ):
+            db_session.add(
+                ChatMessage(  # type: ignore[arg-type]
+                    session_id=sid,
+                    seq=seq,
+                    role=role,
+                    content=content,
+                    meta={},
+                    created_at=same,
+                )
+            )
+        await db_session.flush()
+
+        messages = await client.get(
+            _messages_path(pid, sid), headers=user["_headers"]
+        )
+        body = messages.json()
+        assert [m["seq"] for m in body["items"]] == [1, 2]
+
+    async def test_drop_oldest_under_prompt_budget(self, client, fake_llm):
+        old = os.environ.get("AI_CHAT_PROMPT_MAX_BYTES")
+        os.environ["AI_CHAT_PROMPT_MAX_BYTES"] = "2000"
+        get_settings.cache_clear()
+        try:
+            user, _, pid = await _seed_owner(client)
+            fake_llm.queue(*("ok" for _ in range(6)))
+            session = await _create_session(client, user, pid)
+            sid = session["id"]
+            questions = []
+            for i in range(6):
+                q = f"{'a' * 500} {i}"
+                questions.append(q)
+                response = await _chat(client, user, pid, q, session_id=sid)
+                assert response.status_code == 200
+
+            sent = fake_llm.calls[-1][1]
+            assert questions[-1] in sent  # current question survives
+            assert questions[0] not in sent  # oldest dropped
+        finally:
+            if old is None:
+                os.environ.pop("AI_CHAT_PROMPT_MAX_BYTES", None)
+            else:
+                os.environ["AI_CHAT_PROMPT_MAX_BYTES"] = old
+            get_settings.cache_clear()
 
 
 class TestPromptInjectionIsolation:
