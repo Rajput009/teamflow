@@ -25,8 +25,19 @@ from app.models import ChatMessage, ChatSession
 from app.repositories.chat_repository import ChatRepository
 
 
+def _truncate_by_utf8_bytes(text: str, max_bytes: int) -> str:
+    """Cut a string to a byte cap without ever emitting an invalid/oversized
+    UTF-8 value. Slicing the encoded bytes and decoding with `ignore` drops a
+    partial multi-byte sequence, so the result is always valid and <= cap."""
+    raw = text.encode("utf-8")
+    if len(raw) <= max_bytes:
+        return text
+    return raw[:max_bytes].decode("utf-8", errors="ignore")
+
+
 def _truncate_summary(text: str, max_bytes: int) -> str:
-    """Truncate at the four schema headings, keeping them intact."""
+    """Truncate at the four schema headings, keeping them intact. If the model
+    returns prose without headings, fall back to a hard byte truncation."""
     headings = (
         "Decisions:",
         "Open questions:",
@@ -44,16 +55,7 @@ def _truncate_summary(text: str, max_bytes: int) -> str:
         else:
             kept.append(f"{current} {line}".strip() if current else line)
             current = ""
-    out = "\n".join(kept)
-    while len(out.encode("utf-8")) > max_bytes:
-        out = out[: max_bytes]
-        # never leave a half-encoded multibyte char
-        try:
-            out.encode("utf-8")
-            break
-        except UnicodeEncodeError:
-            out = out[:-1]
-    return out
+    return _truncate_by_utf8_bytes("\n".join(kept), max_bytes)
 
 
 async def summarize_chat_session(

@@ -34,7 +34,9 @@ class TestWorkerBody:
             async def scalar(self, _query):
                 nonlocal calls
                 calls += 1
-                return SimpleNamespace(summary=None) if calls == 1 else None
+                if calls == 1:
+                    return SimpleNamespace(summary=None, user_id=uuid.UUID(int=1))
+                return None
 
             async def scalars(self, _query):
                 return SimpleNamespace(all=lambda: [])
@@ -60,7 +62,7 @@ class TestWorkerBody:
             raise AssertionError("LLM must not be called below threshold")
 
         monkeypatch.setattr("app.workers.chat_summary.ChatRepository", FakeRepo)
-        monkeypatch.setattr("app.workers.chat_summary.async_session_factory", FakeFactory)
+        monkeypatch.setattr("app.db.session.async_session_factory", FakeFactory())
         monkeypatch.setattr("app.workers.chat_summary.build_llm_client", fake_build)
 
         await summarize_chat_session(
@@ -142,7 +144,7 @@ class TestWorkerBody:
                 return _Ctx(FakeSession())
 
         monkeypatch.setattr("app.workers.chat_summary.ChatRepository", FakeRepo)
-        monkeypatch.setattr("app.workers.chat_summary.async_session_factory", FakeFactory)
+        monkeypatch.setattr("app.db.session.async_session_factory", FakeFactory())
         monkeypatch.setattr(
             "app.workers.chat_summary.build_llm_client",
             lambda model=None: FakeLLM(),
