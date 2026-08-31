@@ -76,6 +76,8 @@ class ChatMessage(BaseModel):
 
 class ChatRequest(BaseModel):
     question: SafeStr = Field(min_length=1, max_length=4000)
+    # Server owns history after Phase 1; any client-supplied history is ignored.
+    session_id: uuid.UUID | None = None
     history: list[ChatMessage] | None = None
 
 
@@ -145,6 +147,7 @@ async def chat_project(
         actor_membership=membership,
         project_id=project_id,
         question=payload.question,
+        session_id=payload.session_id,
         history=[m.model_dump() for m in (payload.history or [])],
     )
     return ChatResponse(answer=answer, model=get_settings().llm_model)

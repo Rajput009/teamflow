@@ -43,6 +43,16 @@ class Settings(BaseSettings):
     llm_timeout_seconds: float = 60.0
     ai_max_generated_tasks: int = 30
 
+    # --- AI short-term memory (docs/features/13-ai-memory.md §3.4) ---
+    ai_chat_history_messages: int = 20
+    ai_chat_summary_every: int = 10
+    ai_chat_message_max_bytes: int = 16000
+    ai_chat_prompt_max_bytes: int = 60000
+    ai_chat_summary_max_bytes: int = 4000
+    ai_chat_summary_model: str = "openai/gpt-4o-mini"
+    ai_context_block_max_rows: int = 20
+    ai_context_block_max_chars: int = 2000
+
     # --- Cross-cutting (docs/wayfinder/DECISIONS.md, WF-6) ---
     # Comma-separated allowlist of browser origins permitted to call the API.
     # Defaults to "" (no cross-origin access) — secure by default. Use "*"

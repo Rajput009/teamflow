@@ -1,4 +1,5 @@
 from app.models.activity import ActionType, Activity
+from app.models.chat import ChatMessage, ChatSession
 from app.models.comment import Comment
 from app.models.membership import Membership, Organization, OrgRole
 from app.models.notification import Notification, NotificationType
@@ -11,6 +12,8 @@ from app.models.user import User
 __all__ = [
     "ActionType",
     "Activity",
+    "ChatMessage",
+    "ChatSession",
     "Comment",
     "Membership",
     "Notification",

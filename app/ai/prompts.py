@@ -126,6 +126,21 @@ Be conservative: propose the smallest set of actions that satisfies the
 instruction. Do not propose destructive or unrelated actions."""
 
 
+PROMPT_CHAT_SUMMARY_V1 = """\
+You are compressing the OLDEST part of a project assistant conversation that has
+fallen out of the model's recent-message window. You receive the existing
+summary plus the new messages to fold. EXTEND the summary; never regenerate it,
+never repeat the tail, never invent content.
+
+Return ONLY this block, preserving as much of the existing structure as you can:
+
+Decisions:
+Open questions:
+Constraints / preferences mentioned:
+Facts the user asserted:
+"""
+
+
 def retry_suffix(errors_summary: str) -> str:
     """Appended to a failed attempt: the model sees its own validation errors."""
     return (
