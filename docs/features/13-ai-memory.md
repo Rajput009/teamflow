@@ -1,6 +1,7 @@
 # Feature: AI Memory & Context Management (V6)
 
-> Status: **Design / implementation plan** (not yet code).
+> Status: **Phase 1 implemented** (PR in review); Phase 2/3 are non-normative
+> reference only.
 > Layered memory for a productivity AI — short-term conversation memory,
 > long-term curated facts/decisions, and derived memory from the activity log —
 > scoped to the same multi-tenant/RBAC model as everything else in TeamFlow.
@@ -396,6 +397,10 @@ ai_context_block_max_chars: int = 2000
 
 ## 4. Phase 2 — Long-term curated memory  *(design-only until Phase 1 ships)*
 
+> **NON-NORMATIVE — DO NOT IMPLEMENT.** This section is reference only. Nothing
+> here is a ship-scope spec: no schema, migration, API, or endpoint in §4 is
+> approved until at least one real week of Phase 1 chat-session data exists.
+
 This is the layer that makes the AI feel like it has institutional knowledge.
 **Do not build this schema now.** The columns, indexes and approval flow below
 are the shape we *believe* we need; they are deliberately provisional and must be
@@ -635,6 +640,10 @@ A user or a buggy derive job must not silently flood the store. The cap is
 ---
 
 ## 5. Phase 3 — Derived memory + agent memory
+
+> **NON-NORMATIVE — DO NOT IMPLEMENT.** This section is reference only, and it
+> depends on Phase 2 shipping first. No schema, migration, endpoint, or service
+> in §5 is in the Phase 1 ship scope.
 
 ### 5.1 Derived memory (Celery)
 
